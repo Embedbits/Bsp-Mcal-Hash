@@ -14,7 +14,11 @@ This README is the landing page and the **specification of the interface** (mast
 own README with everything that is specific to the family: the instances of the device, their settings and the status of
 the implementation.
 
-> **Status: design.** No implementation exists yet, the interface below is a proposal. Stories and branches follow.
+> **Status: STM32H5 implemented (branch `Dev/STM32H5`).** One-shot, incremental, HMAC and suspend / resume
+> are implemented for the POLL and ISR transfer modes on all twelve STM32H5 lines; the DMA transfer mode
+> serves the plain one-shot request with a word-aligned message (see the STM32H5 family row below). Unit tests
+> run on all twelve lines; integration tests run on the NUCLEO-H503RB, NUCLEO-H533RE and NUCLEO-H563ZI. Other families are still a
+> proposal, their own branches follow.
 
 ---
 
@@ -73,10 +77,15 @@ Rules:
 4. `Hash_Set_Finish` pads the message, waits for the digest and writes it to the output buffer in the byte order of the
    standard. After it the peripheral is idle again.
 5. `Hash_Get_Context` is allowed between two updates only; after it the peripheral is idle and another message can be
-   started. `Hash_Set_Context` restores a context and the incremental calculation continues. A context is valid only
+   started. `Hash_Set_Context` restores a context (including the incomplete word the module keeps outside of the
+   hardware) and the incremental calculation continues. A context is valid only
    for the algorithm, the mode and the device it was taken on.
 6. `Hash_Set_Abort` stops the calculation and clears the hardware (and the DMA transfer); the key and the message
    data are not kept by the module after the request ends.
+7. In the DMA mode `Hash_Set_Calculate` accepts the plain hash (`HASH_MODE_HASH`) of a **word-aligned** message only
+   (the DMA reads the message as 32-bit words; HMAC needs two key phases written by the CPU). The message and the digest
+   buffer must stay valid until the completion or the error callback; the digest is written by the HASH interrupt.
+   The Gpdma channel is initialized by `Hash_Init` and released by `Hash_Deinit`.
 
 ---
 
@@ -87,7 +96,7 @@ master.
 
 | Family | Branch | HASH | Status |
 |---|---|---|---|
-| STM32H5 | `Dev/STM32H5` | `HASH`, SHA-1 and SHA-2 (224 / 256 / 384 / 512) on the lines H523 ... H573, SHA-3 on selected lines, HMAC, DMA, suspend / resume; STM32H503: SHA-1, SHA-224, SHA-256 | planned (first) |
+| STM32H5 | `Dev/STM32H5` | `HASH`, SHA-1 / SHA2-224 / SHA2-256 on all twelve lines; SHA2-384 / SHA2-512 (truncated or not) on every line except H503; SHA-3 / SHAKE128 / SHAKE256 only on H543, H553, H5E4, H5E5, H5F4 and H5F5 (confirmed through the CMSIS ALGO field width and RM0481 Table 397 / RM0492 / RM0517 block diagrams, not from the generic family note); HMAC, suspend / resume, POLL / ISR / DMA (DMA: plain one-shot request only) | implemented |
 | STM32U5 | `Dev/STM32U5` | `HASH` on the lines that have it | planned |
 | STM32H7 | `Dev/STM32H7` | `HASH` (MD5, SHA-1, SHA-2 224 / 256) on the lines that have it | planned |
 | STM32F4, STM32F7 | `Dev/STM32F4`, `Dev/STM32F7` | `HASH` (MD5, SHA-1, and SHA-2 224 / 256 where the device has them) on the crypto lines | planned |
@@ -218,8 +227,9 @@ static hash_Context_t imageContext;
 ## Behaviour and limits
 
 - **Word access only.** The hardware accepts 32-bit words in its FIFO; the module sends the incomplete last word with
-  the number of valid bits and never writes bytes or half-words. A buffer in the flash (the image) is read by the DMA as words,
-  the alignment is handled by the module.
+  the number of valid bits and never writes bytes or half-words. In the DMA mode the message (also an image in the flash)
+  must be word aligned; the 0..15 trailing bytes are sent from a word-aligned copy in the module, the DMA never reads past
+  the end of the message.
 - **Digest byte order.** The digest is written as a byte array in the order of the standard (big-endian words of the
   specification), independent of the endianness of the CPU.
 - **Cache and DMA.** A buffer written by the CPU and read by the DMA must be visible to the DMA (non-cacheable memory or
@@ -228,7 +238,8 @@ static hash_Context_t imageContext;
   ends (or is suspended with `Hash_Get_Context`). The module is not re-entrant from an interrupt while a `Hash_Set_*` call of
   the same message is running.
 - **Time.** A SHA-256 block takes tens of clock cycles; the throughput is limited by the bus and the DMA, not by the
-  hash core. A very large message is split by the module into transfers that fit the DMA counter.
+  hash core. A very large message is split by the module into transfers that fit the DMA counter (chunks of at most
+  65520 bytes with `HASH_CR.MDMAT` set, the last chunk without it, the HASH then starts the final calculation itself).
 - **Secrets.** The key is written to the input FIFO and is not kept by the module; the application clears its copy.
   The peripheral has no side-channel protection (the Saes / Pka modules offer it for the AES and the public-key operations).
 - **Not part of the first version:** the hash of a message in an external memory-mapped memory without the DMA, the

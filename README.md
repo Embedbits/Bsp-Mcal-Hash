@@ -14,7 +14,47 @@ This README is the landing page and the **specification of the interface** (mast
 own README with everything that is specific to the family: the instances of the device, their settings and the status of
 the implementation.
 
-> **Status: design.** No implementation exists yet, the interface below is a proposal. Stories and branches follow.
+> **Status (STM32H7, branch `Dev/STM32H7`): implemented.** Port of the STM32H5 module to the HASH of the STM32H7 lines:
+> one-shot, incremental, HMAC and suspend / resume in the POLL and ISR transfer modes, the DMA transfer mode for the
+> plain one-shot request with a word-aligned message. The HASH exists on STM32H730 / H733 / H735, H750 / H753 / H755 /
+> H757, H7B0 / H7B3 and on the STM32H7R / STM32H7S lines; STM32H723 / H725, H742 / H743 / H745 / H747 and H7A3 have no
+> HASH: every function returns `HASH_REQUEST_ERROR`. The module compiles without warnings for the 22 STM32H7 lines, for
+> the Cortex-M4 of the 6 dual-core lines and for the 4 STM32H7R / STM32H7S lines. Unit tests (Unity + CMock + RegMem,
+> 39 cases): STM32H755 and H7B3 37 pass (the cases of a line without the HASH and of HPDMA1 ignored), STM32H7R3 and H7S7
+> 35 pass (also the two cases of the shared interrupt line ignored), STM32H723, H743, H7A3 (no HASH) 2 pass.
+> Integration tests (12 cases: the FIPS 180-4 / RFC 2202 / RFC 1321 vectors in the POLL mode, the incremental
+> interface, suspend / resume, the DMA mode with one and with more chunks against the POLL digest, the abort of a
+> running DMA request): the firmware builds for all 27 STM32H7 / H7R / H7S presets (STM32H7S3 also at -O0, 98 % of the
+> 64 KB flash); NUCLEO-H755ZI-Q (Cortex-M7, DMA1 stream 0) 12 of 12 in 3 runs, NUCLEO-H723ZG (no HASH) 12 ignored. A
+> board of the STM32H7R / H7S lines (GPDMA1) is not on the IT agent.
+>
+> **STM32H7 specifics:**
+>
+> - **Algorithms.** Classic lines (RM0433 / RM0399 / RM0455 / RM0468): SHA-1, MD5, SHA2-224 and SHA2-256 - the
+>   `HASH_CR.ALGO` field is split into bit 7 and bit 18 (SHA-1 00, MD5 01, SHA2-224 10, SHA2-256 11); no SHA2-384 /
+>   SHA2-512 and no SHA-3. STM32H7R / H7S (RM0477): the HASH of STM32H5 with SHA-1 and SHA2-224 / 256 / 384 / 512 /
+>   512-224 / 512-256; no MD5 and no SHA-3. `Hash_Get_Capability` reports the algorithms of the line.
+> - **Interrupt line shared with the RNG (classic lines).** The HASH and the RNG share the interrupt line `HASH_RNG`
+>   (`NVIC_PERIPH_IRQ_HASH_RNG`). In the ISR / DMA mode `Hash_Init` takes the line only when it is not activated or
+>   when it is activated with the handler of the Hash module (`Nvic_Get_PeriphIrq_State`, `Nvic_Get_PeriphIrq_Handler`);
+>   a line activated with another handler (the Rng module in its interrupt mode) is rejected with `HASH_REQUEST_ERROR`.
+>   `Hash_Deinit` deactivates the line only after the ISR / DMA mode. The Rng module is not changed: `Rng_Init`,
+>   `Rng_Deinit` and `Rng_Set_IrqInactive` deactivate the line, `Rng_Set_IrqActive` registers the RNG handler on it.
+>   Rules for an application with both modules: the Hash ISR / DMA mode and the Rng interrupt mode exclude each other;
+>   with the Hash ISR / DMA mode call `Rng_Init` before `Hash_Init` and `Rng_Deinit` after `Hash_Deinit`. The Hash
+>   POLL mode has no such rule. STM32H7R / H7S have their own HASH and RNG lines.
+> - **DMA mode.** Classic lines: one stream of DMA1 / DMA2 of the Dma module (default DMA1 stream 0, DMAMUX1 request
+>   HASH_IN, 32-bit data items, chunks of at most 262128 bytes = 65532 items of `DMA_SxNDTR`). STM32H7R / H7S: a GPDMA1
+>   channel of the Gpdma module (default channel 0, chunks of at most 65520 bytes); only GPDMA1 has the request HASH_IN,
+>   `Hash_Init` rejects `DmaPeriphId` = `GPDMA_PERIPH_2` (HPDMA1). The DMA items of `hash_Config_t` have the types of
+>   the DMA module of the line (`hash_DmaPeriphId_t`, `hash_DmaChannelId_t`, `hash_DmaPriority_t`). The message shall
+>   be in a memory that the DMA reaches (the flash, the AXI SRAM, SRAM1 .. SRAM4; not the DTCM); with the data cache
+>   enabled the caller keeps the message coherent.
+> - **Device errata.** "HASH input data may be corrupted when DMA is used" (ES0392 2.2.28: STM32H742 / H743 / H745 /
+>   H747 / H750 / H753 / H755 / H757; ES0445 2.3.12: STM32H7A3 / H7B3 / H7B0): the Dma module serves the request
+>   HASH_IN with bufferable transfers (`DMA_SxCR.TRBUFF`, Dma Dev/STM32H7 AB#2352); the other rule of the workaround -
+>   no enabled stream on the other DMA controller during the HASH transfer - is a rule of the application (or the
+>   POLL / ISR mode is used).
 
 ---
 
@@ -73,10 +113,16 @@ Rules:
 4. `Hash_Set_Finish` pads the message, waits for the digest and writes it to the output buffer in the byte order of the
    standard. After it the peripheral is idle again.
 5. `Hash_Get_Context` is allowed between two updates only; after it the peripheral is idle and another message can be
-   started. `Hash_Set_Context` restores a context and the incremental calculation continues. A context is valid only
+   started. `Hash_Set_Context` restores a context (including the incomplete word the module keeps outside of the
+   hardware) and the incremental calculation continues. A context is valid only
    for the algorithm, the mode and the device it was taken on.
 6. `Hash_Set_Abort` stops the calculation and clears the hardware (and the DMA transfer); the key and the message
    data are not kept by the module after the request ends.
+7. In the DMA mode `Hash_Set_Calculate` accepts the plain hash (`HASH_MODE_HASH`) of a **word-aligned** message only
+   (the DMA reads the message as 32-bit words; HMAC needs two key phases written by the CPU). The message and the digest
+   buffer must stay valid until the completion or the error callback; the digest is written by the HASH interrupt.
+   The DMA channel (a Dma stream on the classic STM32H7 lines, a Gpdma channel on STM32H7R / H7S) is
+   initialized by `Hash_Init` and released by `Hash_Deinit`.
 
 ---
 
@@ -87,9 +133,9 @@ master.
 
 | Family | Branch | HASH | Status |
 |---|---|---|---|
-| STM32H5 | `Dev/STM32H5` | `HASH`, SHA-1 and SHA-2 (224 / 256 / 384 / 512) on the lines H523 ... H573, SHA-3 on selected lines, HMAC, DMA, suspend / resume; STM32H503: SHA-1, SHA-224, SHA-256 | planned (first) |
+| STM32H5 | `Dev/STM32H5` | `HASH`, SHA-1 / SHA2-224 / SHA2-256 on all twelve lines; SHA2-384 / SHA2-512 (truncated or not) on every line except H503; SHA-3 / SHAKE128 / SHAKE256 only on H543, H553, H5E4, H5E5, H5F4 and H5F5 (confirmed through the CMSIS ALGO field width and RM0481 Table 397 / RM0492 / RM0517 block diagrams, not from the generic family note); HMAC, suspend / resume, POLL / ISR / DMA (DMA: plain one-shot request only) | implemented |
 | STM32U5 | `Dev/STM32U5` | `HASH` on the lines that have it | planned |
-| STM32H7 | `Dev/STM32H7` | `HASH` (MD5, SHA-1, SHA-2 224 / 256) on the lines that have it | planned |
+| STM32H7 | `Dev/STM32H7` | `HASH` on STM32H730 / H733 / H735, H750 / H753 / H755 / H757, H7B0 / H7B3 (SHA-1, MD5, SHA2-224 / 256) and STM32H7R / H7S (SHA-1, SHA2-224 ... 512, no MD5), no HASH on STM32H723 / H725, H742 / H743 / H745 / H747, H7A3; no SHA-3; HMAC, suspend / resume, POLL / ISR / DMA (Dma streams on the classic lines, GPDMA1 on STM32H7R / H7S); the interrupt line HASH_RNG shared with the RNG on the classic lines | implemented |
 | STM32F4, STM32F7 | `Dev/STM32F4`, `Dev/STM32F7` | `HASH` (MD5, SHA-1, and SHA-2 224 / 256 where the device has them) on the crypto lines | planned |
 | STM32G4, STM32L4, STM32U3 | `Dev/STM32G4`, `Dev/STM32L4`, `Dev/STM32U3` | device dependent | planned |
 
@@ -218,8 +264,9 @@ static hash_Context_t imageContext;
 ## Behaviour and limits
 
 - **Word access only.** The hardware accepts 32-bit words in its FIFO; the module sends the incomplete last word with
-  the number of valid bits and never writes bytes or half-words. A buffer in the flash (the image) is read by the DMA as words,
-  the alignment is handled by the module.
+  the number of valid bits and never writes bytes or half-words. In the DMA mode the message (also an image in the flash)
+  must be word aligned; the 0..15 trailing bytes are sent from a word-aligned copy in the module, the DMA never reads past
+  the end of the message.
 - **Digest byte order.** The digest is written as a byte array in the order of the standard (big-endian words of the
   specification), independent of the endianness of the CPU.
 - **Cache and DMA.** A buffer written by the CPU and read by the DMA must be visible to the DMA (non-cacheable memory or
@@ -228,7 +275,9 @@ static hash_Context_t imageContext;
   ends (or is suspended with `Hash_Get_Context`). The module is not re-entrant from an interrupt while a `Hash_Set_*` call of
   the same message is running.
 - **Time.** A SHA-256 block takes tens of clock cycles; the throughput is limited by the bus and the DMA, not by the
-  hash core. A very large message is split by the module into transfers that fit the DMA counter.
+  hash core. A very large message is split by the module into transfers that fit the DMA counter (chunks of at most
+  65520 bytes of a Gpdma block or 262128 bytes of a Dma stream with `HASH_CR.MDMAT` set, the last chunk without it,
+  the HASH then starts the final calculation itself).
 - **Secrets.** The key is written to the input FIFO and is not kept by the module; the application clears its copy.
   The peripheral has no side-channel protection (the Saes / Pka modules offer it for the AES and the public-key operations).
 - **Not part of the first version:** the hash of a message in an external memory-mapped memory without the DMA, the
@@ -239,8 +288,10 @@ static hash_Context_t imageContext;
 ## Dependencies
 
 - **Rcc** - peripheral clock and reset
-- **Nvic** - interrupt of the peripheral
-- **Gpdma** - DMA transfers of the input data
+- **Nvic** - interrupt of the peripheral (classic STM32H7 lines: the line HASH_RNG shared with the RNG,
+  `Nvic_Get_PeriphIrq_State` / `Nvic_Get_PeriphIrq_Handler`)
+- **Dma** - DMA transfers of the input data (DMA1 / DMA2 streams, DMAMUX1 request HASH_IN; classic STM32H7 lines)
+- **Gpdma** - DMA transfers of the input data (GPDMA1; STM32H7R / STM32H7S)
 - **RAL (Register Abstraction Layer)** - used internally to access the registers
 
 All mandatory RCC, NVIC and DMA configurations are handled internally.
@@ -268,8 +319,8 @@ The module follows the common rules of the MCAL layer, so that it behaves like t
   for the device line; a pin is an item `HASH_<SIGNAL>_PIN_<INSTANCE>_P<port><pin>` and there is an `*_UNUSED` item. A choice
   that is not in the list cannot be written.
 - **Own peripheral only.** The module calls only the registers / LL functions of its own peripheral. The clocks, the
-  interrupts, the pins, the DMA and the EXTI lines go through the API of the Rcc, Nvic, Gpio, Gpdma and Exti modules; a
-  missing function is added to that module, it is not bypassed.
+  interrupts, the pins, the DMA and the EXTI lines go through the API of the Rcc, Nvic, Gpio, Dma / Gpdma and Exti
+  modules; a missing function is added to that module, it is not bypassed.
 - **Init verifies itself.** `Hash_Init` checks the result at the end; when it is not as required, the module is
   deinitialized and an error is returned. The waiting for the hardware is a loop on the register state with a timeout,
   never a blind delay.
